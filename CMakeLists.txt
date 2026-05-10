@@ -5,7 +5,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-    add_compile_options(/utf-8)
+    # 仅 C/C++：/utf-8 不作为裸参传给 nvcc，否则子目录中 .cu 会报 “single input file”
+    add_compile_options($<$<OR:$<COMPILE_LANGUAGE:CXX>,$<COMPILE_LANGUAGE:C>>:/utf-8>)
 endif()
 
 get_filename_component(_Y26_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
@@ -105,6 +106,9 @@ else()
     set(YOLO26_HAS_ONNXRUNTIME OFF)
     message(WARNING "ONNX Runtime not found under ONNXRUNTIME_DIR; CPU (--cpu) backend disabled.")
 endif()
+
+# YOLO26 结构图（cfg/models/26/*.yaml 解析、形状推理）与 SiLU 等 CUDA 基元：algorithm/Yolo26_cpp/cuda/
+add_subdirectory(cuda)
 
 # 目录布局（对齐 YOLO26_TensorRT_ONNX）：include/yolo26/*.h，src/**.cpp
 set(YOLO26_CPP_SOURCES
