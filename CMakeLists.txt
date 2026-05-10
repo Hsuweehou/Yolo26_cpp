@@ -22,9 +22,6 @@ endif()
 message(STATUS "THIRD_PARTY_LIBRARY_DIR = ${THIRD_PARTY_LIBRARY_DIR}")
 
 message(STATUS "CMAKE_SYSTEM_NAME: ${CMAKE_SYSTEM_NAME}")
-# set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE})
-# set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE})
-# set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/lib/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE})
 
 if(NOT DEFINED CMAKE_BUILD_TYPE)
     message(STATUS "CMAKE_BUILD_TYPE is not defined; defaulting to Debug")
@@ -81,19 +78,60 @@ if(NOT EXISTS "${YAML_CPP_ROOT}/lib/yaml-cpp.lib")
 endif()
 message(STATUS "YAML_CPP_ROOT = ${YAML_CPP_ROOT}")
 
-add_executable(Yolo26_cpp
-    main.cpp
-    TrtEngineCache.cpp
-    Yolo26Seg.cpp
-    Yolo26Pose.cpp
-    Yolo26Detect.cpp
-    Yolo26Obb.cpp
+# ONNX Runtime（CPU）：可选；找到则编译 Yolo26OnnxCpuSession 并定义 YOLO26_HAS_ONNXRUNTIME
+# 默认：3rdParty 下的官方 x64 CPU 包（如 D:/codes/3rdParty/OnnxRuntime/onnxruntime-x64-cpu-1.23.2）
+if(NOT DEFINED ONNXRUNTIME_DIR)
+    if(DEFINED ENV{ONNXRUNTIME_DIR})
+        set(ONNXRUNTIME_DIR $ENV{ONNXRUNTIME_DIR} CACHE PATH "ONNX Runtime root (include/, lib/)")
+    else()
+        set(ONNXRUNTIME_DIR "${THIRD_PARTY_LIBRARY_DIR}/OnnxRuntime/onnxruntime-x64-cpu-1.23.2" CACHE PATH "ONNX Runtime root (include/, lib/)")
+    endif()
+endif()
+message(STATUS "ONNXRUNTIME_DIR = ${ONNXRUNTIME_DIR}")
+
+# 切换 ONNXRUNTIME_DIR 后勿沿用 CMakeCache 里旧的 find_* 结果
+unset(Y26_ONNXRUNTIME_INCLUDE_DIR CACHE)
+unset(Y26_ONNXRUNTIME_LIB CACHE)
+
+find_path(Y26_ONNXRUNTIME_INCLUDE_DIR NAMES onnxruntime_cxx_api.h PATHS "${ONNXRUNTIME_DIR}/include" NO_DEFAULT_PATH)
+find_library(Y26_ONNXRUNTIME_LIB NAMES onnxruntime
+    PATHS "${ONNXRUNTIME_DIR}/lib" "${ONNXRUNTIME_DIR}/lib64" "${ONNXRUNTIME_DIR}"
+    NO_DEFAULT_PATH)
+
+if(Y26_ONNXRUNTIME_INCLUDE_DIR AND Y26_ONNXRUNTIME_LIB)
+    set(YOLO26_HAS_ONNXRUNTIME ON)
+    message(STATUS "ONNX Runtime: enabled (${Y26_ONNXRUNTIME_LIB})")
+else()
+    set(YOLO26_HAS_ONNXRUNTIME OFF)
+    message(WARNING "ONNX Runtime not found under ONNXRUNTIME_DIR; CPU (--cpu) backend disabled.")
+endif()
+
+# 目录布局（对齐 YOLO26_TensorRT_ONNX）：include/yolo26/*.h，src/**.cpp
+set(YOLO26_CPP_SOURCES
+    src/main.cpp
+    src/common/TrtEngineCache.cpp
+    src/trt/Yolo26TrtSession.cpp
+    src/trt/Yolo26BackendFactory.cpp
+    src/variants/Yolo26Detect.cpp
+    src/variants/Yolo26Obb.cpp
+    src/variants/Yolo26Pose.cpp
+    src/variants/Yolo26Seg.cpp
 )
+if(YOLO26_HAS_ONNXRUNTIME)
+    list(APPEND YOLO26_CPP_SOURCES src/cpu/Yolo26OnnxCpuSession.cpp)
+endif()
+
+add_executable(Yolo26_cpp ${YOLO26_CPP_SOURCES})
 
 target_include_directories(Yolo26_cpp PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${TRT_DIR}/include
     ${YAML_CPP_ROOT}/include
 )
+if(YOLO26_HAS_ONNXRUNTIME)
+    target_include_directories(Yolo26_cpp PRIVATE ${Y26_ONNXRUNTIME_INCLUDE_DIR})
+    target_compile_definitions(Yolo26_cpp PRIVATE YOLO26_HAS_ONNXRUNTIME)
+endif()
 
 target_link_directories(Yolo26_cpp PRIVATE ${TRT_DIR}/lib)
 
@@ -106,6 +144,9 @@ if(WIN32)
         nvinfer_plugin_10
         "$<IF:$<CONFIG:Debug>,${YAML_CPP_ROOT}/lib/yaml-cppd.lib,${YAML_CPP_ROOT}/lib/yaml-cpp.lib>"
     )
+    if(YOLO26_HAS_ONNXRUNTIME)
+        target_link_libraries(Yolo26_cpp PRIVATE ${Y26_ONNXRUNTIME_LIB})
+    endif()
 else()
     target_link_libraries(Yolo26_cpp PRIVATE
         ${OpenCV_LIBS}
@@ -118,6 +159,9 @@ else()
         message(FATAL_ERROR "yaml-cpp library not found under ${YAML_CPP_ROOT}/lib (non-Windows)")
     endif()
     target_link_libraries(Yolo26_cpp PRIVATE ${_Y26_YAML_CPP_LIB})
+    if(YOLO26_HAS_ONNXRUNTIME)
+        target_link_libraries(Yolo26_cpp PRIVATE ${Y26_ONNXRUNTIME_LIB})
+    endif()
 endif()
 
 if(WIN32 AND EXISTS "${YAML_CPP_ROOT}/bin")
@@ -130,11 +174,7 @@ if(WIN32 AND EXISTS "${YAML_CPP_ROOT}/bin")
     )
 endif()
 
-# ##########################################################
-# 生成 exe 后自动复制依赖 DLL 到输出目录（Windows）
-# ##########################################################
 if(WIN32)
-    # 仅当 exe 目录中尚不存在同名 DLL 时才复制（不覆盖已有文件）
     add_custom_command(
         TARGET Yolo26_cpp POST_BUILD
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File
@@ -203,4 +243,18 @@ if(WIN32)
     endif()
 
     message(STATUS "DLL auto-copy configured for Yolo26_cpp")
+
+    if(YOLO26_HAS_ONNXRUNTIME AND EXISTS "${ONNXRUNTIME_DIR}/lib")
+        foreach(_ort_dll onnxruntime.dll onnxruntime_providers_shared.dll)
+            if(EXISTS "${ONNXRUNTIME_DIR}/lib/${_ort_dll}")
+                add_custom_command(
+                    TARGET Yolo26_cpp POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${ONNXRUNTIME_DIR}/lib/${_ort_dll}"
+                        "$<TARGET_FILE_DIR:Yolo26_cpp>/${_ort_dll}"
+                    COMMENT "[Yolo26_cpp] Copy ONNX Runtime DLL if missing: ${_ort_dll}"
+                )
+            endif()
+        endforeach()
+    endif()
 endif()

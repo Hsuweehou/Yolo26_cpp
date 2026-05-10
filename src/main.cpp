@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -6,15 +7,16 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <yaml-cpp/yaml.h>
 
-#include "Yolo26Detect.h"
-#include "Yolo26Obb.h"
-#include "Yolo26Pose.h"
-#include "Yolo26Seg.h"
+#include "yolo26/Yolo26Detect.h"
+#include "yolo26/Yolo26Obb.h"
+#include "yolo26/Yolo26Pose.h"
+#include "yolo26/Yolo26Seg.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -32,7 +34,7 @@ static void initConsoleUtf8() {
 
 namespace fs = std::filesystem;
 
-// exe 所在目录；从 build/Release 运行时靠它找 cfg/datasets
+/// 可执行文件所在目录（用于从 build/Release 运行时解析 cfg/datasets/...）
 static fs::path getExecutableDirectory() {
 #if defined(_WIN32)
     std::wstring buf(MAX_PATH * 2, L'\0');
@@ -58,7 +60,7 @@ static fs::path getExecutableDirectory() {
 #endif
 }
 
-// 把类别文件路径补成真实路径（在 build 里跑时常写错相对路径）
+/// 将用户输入的类别文件路径解析为实际存在的路径（常见错误：在 build/Release 下使用 ./datasets/coco.yaml）
 static std::string resolveClassNamesInputPath(const std::string& userPath) {
     std::error_code ec;
     const fs::path p(userPath);
@@ -87,6 +89,7 @@ static std::string resolveClassNamesInputPath(const std::string& userPath) {
         }
         const fs::path exeDir = getExecutableDirectory();
         if (!exeDir.empty()) {
+            // .../Yolo26_cpp/build/Release/exe -> ../../cfg/datasets
             if (std::string r = tryCanon(exeDir / ".." / ".." / "cfg" / "datasets" / fname); !r.empty()) {
                 return r;
             }
@@ -99,7 +102,7 @@ static std::string resolveClassNamesInputPath(const std::string& userPath) {
     return userPath;
 }
 
-// 图像路径，规则跟类别文件差不多（cwd 不对时按 exe 来解析）
+/// 解析输入图像路径（与类别 yaml 类似：在 build/Release 下运行时 cwd 常不对，需相对 exe 解析 ../../cfg/datasets/...）
 static std::string resolveImageInputPath(const std::string& userPath) {
     std::error_code ec;
     const fs::path p(userPath);
@@ -125,6 +128,7 @@ static std::string resolveImageInputPath(const std::string& userPath) {
 
     const fs::path exeDir = getExecutableDirectory();
     if (!exeDir.empty()) {
+        // 对 ../../cfg/datasets/xxx 等路径，需以 exe 所在目录为基准做 weakly_canonical
         if (std::string r = tryResolved(exeDir / p); !r.empty()) {
             return r;
         }
@@ -159,7 +163,7 @@ static std::string trimCopy(std::string s) {
     return s.substr(start);
 }
 
-// txt：一行一个类名，第一行是 class 0，顺序要和训练一致
+/// 每行一个类别名：第 1 行 = 类别 0（与 Ultralytics 训练时类别顺序一致）
 static std::vector<std::string> loadClassNamesFromTextFile(const std::string& path) {
     std::vector<std::string> names;
     std::ifstream in(path);
@@ -177,7 +181,7 @@ static std::vector<std::string> loadClassNamesFromTextFile(const std::string& pa
     return names;
 }
 
-// data.yaml 顶层 names:，支持 map(0: cat) 或列表
+/// 解析 Ultralytics data.yaml 顶层的 `names:`（map: 0: a / sequence: - a / 单行 sequence）
 static std::vector<std::string> loadClassNamesFromUltralyticsDataYaml(const std::string& path) {
     try {
         const YAML::Node root = YAML::LoadFile(path);
@@ -232,7 +236,7 @@ static bool pathLooksLikeYaml(const std::string& path) {
     return ext == ".yaml" || ext == ".yml";
 }
 
-// --names：yaml 或 txt
+/// --names 指向 Ultralytics data.yaml（解析 names:）或纯文本（每行一类名）
 static std::vector<std::string> loadClassNamesFromNamesArg(const std::string& path) {
     const std::string resolved = resolveClassNamesInputPath(path);
     if (resolved != path) {
@@ -269,7 +273,7 @@ static std::string formatDetectLabel(const std::vector<std::string>& classNames,
     return std::format("cls{} {:.2f}", classIndex, score);
 }
 
-// 可缩放窗口，大小跟图一致（和分割里那几个窗口行为一致）
+/// 与分割里 original / mask 窗口一致：可缩放窗口，并将窗口尺寸设为与图像相同
 static void imshowSized(const char* windowName, const cv::Mat& img) {
     if (img.empty()) {
         return;
@@ -283,20 +287,30 @@ static void printUsage(const char* prog) {
     std::cerr
         << "用法：\n"
         << "  分割\n"
-        << "    " << prog << " <model.onnx> [--names <data.yaml|classes.txt>] <图片路径>\n"
-        << "    " << prog << " <model.onnx> [--names <data.yaml|classes.txt>] --camera [摄像头序号]\n"
+        << "    " << prog << " <model.onnx> [--cpu] [--names <data.yaml|classes.txt>] <图片路径>\n"
+        << "    " << prog << " <model.onnx> [--cpu] [--names <data.yaml|classes.txt>] --camera [摄像头序号]\n"
         << "  检测\n"
-        << "    " << prog << " <model.onnx> --detect [--names <data.yaml|classes.txt>] <图片路径>\n"
-        << "    " << prog << " <model.onnx> --detect [--names <data.yaml|classes.txt>] --camera [摄像头序号]\n"
+        << "    " << prog << " <model.onnx> --detect [--cpu] [--names <data.yaml|classes.txt>] <图片路径>\n"
+        << "    " << prog << " <model.onnx> --detect [--cpu] [--names <data.yaml|classes.txt>] --camera [摄像头序号]\n"
         << "  旋转框（OBB）\n"
-        << "    " << prog << " <model.onnx> --obb [--names <data.yaml|classes.txt>] <图片路径>\n"
-        << "    " << prog << " <model.onnx> --obb [--names <data.yaml|classes.txt>] --camera [摄像头序号]\n"
+        << "    " << prog << " <model.onnx> --obb [--cpu] [--names <data.yaml|classes.txt>] <图片路径>\n"
+        << "    " << prog << " <model.onnx> --obb [--cpu] [--names <data.yaml|classes.txt>] --camera [摄像头序号]\n"
         << "  姿态\n"
-        << "    " << prog << " <model.onnx> --pose [--names <data.yaml|classes.txt>] <图片路径>\n"
-        << "    " << prog << " <model.onnx> --pose [--names <data.yaml|classes.txt>] --camera [摄像头序号]\n"
+        << "    " << prog << " <model.onnx> --pose [--cpu] [--names <data.yaml|classes.txt>] <图片路径>\n"
+        << "    " << prog << " <model.onnx> --pose [--cpu] [--names <data.yaml|classes.txt>] --camera [摄像头序号]\n"
         << "\n"
+        << "  --cpu：使用 ONNX Runtime CPU 推理（需 CMake 找到 ONNXRUNTIME_DIR 并成功链接）。\n"
         << "  --names：yaml 取 data.yaml 中的 names；txt 则每行一个类名。类别数须与模型 nc 一致。\n"
         << "  摄像头预览时按 q 或 ESC 退出。\n";
+}
+
+static bool argvHasCpuFlag(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--cpu") {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void visualizeSingleImage(const cv::Mat& image, const std::vector<YOLOInferResult>& results,
@@ -315,8 +329,25 @@ static void visualizeSingleImage(const cv::Mat& image, const std::vector<YOLOInf
     cv::destroyAllWindows();
 }
 
+/// 在可视化图左上角叠画当前帧率（仅摄像头预览用）。
+static void drawFpsOverlayTopLeft(cv::Mat& bgr, double fpsSmoothed) {
+    if (bgr.empty() || !std::isfinite(fpsSmoothed) || fpsSmoothed < 0.1) {
+        return;
+    }
+    const std::string text = std::format("{:.1f} FPS", fpsSmoothed);
+    constexpr double kFontScale = 0.65;
+    constexpr int kThickness = 2;
+    int baseline = 0;
+    const cv::Size ts = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, kFontScale, kThickness, &baseline);
+    const int margin = 10;
+    const int yText = margin + ts.height;
+    const cv::Rect bgRect(margin - 2, margin - 2, ts.width + 4, ts.height + 6);
+    cv::rectangle(bgr, bgRect, {40, 40, 40}, -1);
+    cv::putText(bgr, text, {margin, yText + 2}, cv::FONT_HERSHEY_SIMPLEX, kFontScale, {0, 255, 64}, kThickness);
+}
+
 static void visualizeCameraFrame(cv::Mat& frame, const std::vector<YOLOInferResult>& results,
-                                 const std::vector<std::string>& classNames) {
+                                 const std::vector<std::string>& classNames, double fpsEma) {
     static const cv::Scalar kPalette[] = {
         {0, 255, 0},
         {255, 0, 0},
@@ -341,6 +372,7 @@ static void visualizeCameraFrame(cv::Mat& frame, const std::vector<YOLOInferResu
         int ty = std::max(ts.height, res.rect.y - 4);
         cv::putText(vis, label, {res.rect.x, ty}, cv::FONT_HERSHEY_SIMPLEX, 0.5, c, 1);
     }
+    drawFpsOverlayTopLeft(vis, fpsEma);
     imshowSized("YOLO26 Seg (camera)", vis);
 }
 
@@ -392,11 +424,12 @@ static void visualizePoseSingleImage(const cv::Mat& image, const std::vector<Pos
 }
 
 static void visualizePoseCameraFrame(cv::Mat& frame, const std::vector<PoseInferResult>& results,
-                                     const std::vector<std::string>& classNames) {
+                                     const std::vector<std::string>& classNames, double fpsEma) {
     cv::Mat vis = frame.clone();
     for (const auto& res : results) {
         drawPoseOverlay(vis, res, classNames);
     }
+    drawFpsOverlayTopLeft(vis, fpsEma);
     imshowSized("YOLO26 Pose (camera)", vis);
 }
 
@@ -427,7 +460,7 @@ static void visualizeDetectSingleImage(const cv::Mat& image, const std::vector<D
 }
 
 static void visualizeDetectCameraFrame(cv::Mat& frame, const std::vector<DetectInferResult>& results,
-                                       const std::vector<std::string>& classNames) {
+                                       const std::vector<std::string>& classNames, double fpsEma) {
     static const cv::Scalar kPalette[] = {
         {0, 255, 0},
         {255, 0, 0},
@@ -447,6 +480,7 @@ static void visualizeDetectCameraFrame(cv::Mat& frame, const std::vector<DetectI
         int ty = std::max(ts.height, res.rect.y - 4);
         cv::putText(vis, label, {res.rect.x, ty}, cv::FONT_HERSHEY_SIMPLEX, 0.6, c, 1);
     }
+    drawFpsOverlayTopLeft(vis, fpsEma);
     imshowSized("YOLO26 Detect (camera)", vis);
 }
 
@@ -488,7 +522,7 @@ static void visualizeObbSingleImage(const cv::Mat& image, const std::vector<ObbI
 }
 
 static void visualizeObbCameraFrame(cv::Mat& frame, const std::vector<ObbInferResult>& results,
-                                    const std::vector<std::string>& classNames) {
+                                    const std::vector<std::string>& classNames, double fpsEma) {
     static const cv::Scalar kPalette[] = {
         {0, 255, 0},
         {255, 0, 0},
@@ -503,6 +537,7 @@ static void visualizeObbCameraFrame(cv::Mat& frame, const std::vector<ObbInferRe
         const cv::Scalar& c = kPalette[res.classIndex % kPaletteN];
         drawObbOverlay(vis, res, c, classNames);
     }
+    drawFpsOverlayTopLeft(vis, fpsEma);
     imshowSized("YOLO26 OBB (camera)", vis);
 }
 
@@ -531,7 +566,9 @@ static int runObbCamera(Yolo26Obb& model, int cameraIndex, const std::vector<std
     }
 
     cv::Mat frame;
+    static double fpsEma = 0.0;
     for (;;) {
+        const auto t0 = cv::getTickCount();
         cap >> frame;
         if (frame.empty()) {
             std::cerr << "读取摄像头帧失败，退出。\n";
@@ -539,7 +576,12 @@ static int runObbCamera(Yolo26Obb& model, int cameraIndex, const std::vector<std
         }
 
         std::vector<ObbInferResult> results = model.inference(frame);
-        visualizeObbCameraFrame(frame, results, classNames);
+        const double sec = (cv::getTickCount() - t0) / cv::getTickFrequency();
+        if (sec > 1e-6) {
+            const double inst = 1.0 / sec;
+            fpsEma = (fpsEma < 1e-3) ? inst : 0.88 * fpsEma + 0.12 * inst;
+        }
+        visualizeObbCameraFrame(frame, results, classNames, fpsEma);
 
         int key = cv::waitKey(1);
         if (key == 'q' || key == 'Q' || key == 27) {
@@ -576,7 +618,9 @@ static int runDetectCamera(Yolo26Detect& model, int cameraIndex, const std::vect
     }
 
     cv::Mat frame;
+    static double fpsEma = 0.0;
     for (;;) {
+        const auto t0 = cv::getTickCount();
         cap >> frame;
         if (frame.empty()) {
             std::cerr << "读取摄像头帧失败，退出。\n";
@@ -584,7 +628,12 @@ static int runDetectCamera(Yolo26Detect& model, int cameraIndex, const std::vect
         }
 
         std::vector<DetectInferResult> results = model.inference(frame);
-        visualizeDetectCameraFrame(frame, results, classNames);
+        const double sec = (cv::getTickCount() - t0) / cv::getTickFrequency();
+        if (sec > 1e-6) {
+            const double inst = 1.0 / sec;
+            fpsEma = (fpsEma < 1e-3) ? inst : 0.88 * fpsEma + 0.12 * inst;
+        }
+        visualizeDetectCameraFrame(frame, results, classNames, fpsEma);
 
         int key = cv::waitKey(1);
         if (key == 'q' || key == 'Q' || key == 27) {
@@ -621,7 +670,9 @@ static int runCamera(Yolo26Seg& model, int cameraIndex, const std::vector<std::s
     }
 
     cv::Mat frame;
+    static double fpsEma = 0.0;
     for (;;) {
+        const auto t0 = cv::getTickCount();
         cap >> frame;
         if (frame.empty()) {
             std::cerr << "读取摄像头帧失败，退出。\n";
@@ -629,7 +680,12 @@ static int runCamera(Yolo26Seg& model, int cameraIndex, const std::vector<std::s
         }
 
         std::vector<YOLOInferResult> results = model.inference(frame);
-        visualizeCameraFrame(frame, results, classNames);
+        const double sec = (cv::getTickCount() - t0) / cv::getTickFrequency();
+        if (sec > 1e-6) {
+            const double inst = 1.0 / sec;
+            fpsEma = (fpsEma < 1e-3) ? inst : 0.88 * fpsEma + 0.12 * inst;
+        }
+        visualizeCameraFrame(frame, results, classNames, fpsEma);
 
         int key = cv::waitKey(1);
         if (key == 'q' || key == 'Q' || key == 27) {
@@ -666,7 +722,9 @@ static int runPoseCamera(Yolo26Pose& model, int cameraIndex, const std::vector<s
     }
 
     cv::Mat frame;
+    static double fpsEma = 0.0;
     for (;;) {
+        const auto t0 = cv::getTickCount();
         cap >> frame;
         if (frame.empty()) {
             std::cerr << "读取摄像头帧失败，退出。\n";
@@ -674,7 +732,12 @@ static int runPoseCamera(Yolo26Pose& model, int cameraIndex, const std::vector<s
         }
 
         std::vector<PoseInferResult> results = model.inference(frame);
-        visualizePoseCameraFrame(frame, results, classNames);
+        const double sec = (cv::getTickCount() - t0) / cv::getTickFrequency();
+        if (sec > 1e-6) {
+            const double inst = 1.0 / sec;
+            fpsEma = (fpsEma < 1e-3) ? inst : 0.88 * fpsEma + 0.12 * inst;
+        }
+        visualizePoseCameraFrame(frame, results, classNames, fpsEma);
 
         int key = cv::waitKey(1);
         if (key == 'q' || key == 'Q' || key == 27) {
@@ -685,17 +748,23 @@ static int runPoseCamera(Yolo26Pose& model, int cameraIndex, const std::vector<s
     cv::destroyAllWindows();
     return 0;
 }
+
 /*
-* 运行方式:
-*  分割:  exe  <model.onnx>  [--names coco.yaml|classes.txt]  <image_path>
-*         exe  <model.onnx>  [--names ...]  --camera [index]
-*  检测:  exe  <model.onnx>  --detect  [--names coco.yaml|classes.txt]  <image_path>
-*         exe  <model.onnx>  --detect  [--names ...]  --camera [index]
-*  OBB:   exe  <model.onnx>  --obb  [--names ...]  <image_path>
-*         exe  <model.onnx>  --obb  [--names ...]  --camera [index]
-*  姿态:  exe  <model.onnx>  --pose  [--names ...]  <image_path>
-*         exe  <model.onnx>  --pose  [--names ...]  --camera [index]
-*/
+ * 运行方式:
+ *  分割:  exe  <model.onnx>  [--names coco.yaml|classes.txt]  <image_path>
+ *         exe  <model.onnx>  [--names ...]  --camera [index]
+ *  检测:  exe  <model.onnx>  --detect  [--names coco.yaml|classes.txt]  <image_path>   （1×300×6 等）
+ *         exe  <model.onnx>  --detect  [--names ...]  --camera [index]
+ *  OBB:   exe  <model.onnx>  --obb  [--names ...]  <image_path>     （1×300×7 等）
+ *         exe  <model.onnx>  --obb  [--names ...]  --camera [index]
+ *  姿态:  exe  <model.onnx>  --pose  [--names ...]  <image_path>
+ *         exe  <model.onnx>  --pose  [--names ...]  --camera [index]
+ * 
+ * D:\codes\project_template_scanner\algorithm\Yolo26_cpp\build\Debug\yolo26x-obb.onnx --obb --names ../../cfg/datasets/DOTAv1.5.yaml ../../cfg/datasets/P0006.png --cpu/gpu
+ * D:\codes\project_template_scanner\algorithm\Yolo26_cpp\build\Debug\yolo26x-pose.onnx --pose --names ../../cfg/datasets/coco-pose.yaml --camera 0 --cpu/gpu
+ * D:\codes\project_template_scanner\algorithm\Yolo26_cpp\build\Debug\yolo26x-detect.onnx --detect --names ../../cfg/datasets/coco.yaml --camera 0 --cpu/gpu
+ * D:\codes\project_template_scanner\algorithm\Yolo26_cpp\build\Debug\yolo26x-seg.onnx --names ../../cfg/datasets/coco8-seg.yaml --camera 0 --cpu/gpu
+ */
 int main(int argc, char** argv) {
     initConsoleUtf8();
 
@@ -708,6 +777,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const bool wantCpu = argvHasCpuFlag(argc, argv);
+#if !defined(YOLO26_HAS_ONNXRUNTIME)
+    if (wantCpu) {
+        std::cerr << "本构建未启用 ONNX Runtime，无法使用 --cpu。请将 ONNX Runtime 解压到 depends/onnxruntime 或设置 -DONNXRUNTIME_DIR=... 后重新 CMake。\n";
+        return 1;
+    }
+#endif
+    const yolo26::Yolo26BackendKind backendKind =
+#if defined(YOLO26_HAS_ONNXRUNTIME)
+        wantCpu ? yolo26::Yolo26BackendKind::kOnnxRuntime : yolo26::Yolo26BackendKind::kTensorRT;
+#else
+        yolo26::Yolo26BackendKind::kTensorRT;
+#endif
+
     const std::string onnxPath = argv[1];
     const std::string arg2 = argv[2];
 
@@ -716,7 +799,8 @@ int main(int argc, char** argv) {
             .modelFile = onnxPath,
             .scoreThreshold = 0.5f,
             .maxDetections = 50,
-            // 默认 80 类；自己训的数据改 yaml 里 nc
+            // numClasses 默认 80，与 cfg/models/26/yolo26.yaml 的 nc 一致；自定义数据需改 nc
+            .backendKind = backendKind,
         };
         Yolo26Detect detModel(dcfg);
         if (!detModel.init()) {
@@ -726,9 +810,17 @@ int main(int argc, char** argv) {
 
         std::vector<std::string> classNames;
         int ai = 3;
-        while (ai + 1 < argc && std::string(argv[ai]) == "--names") {
-            classNames = loadClassNamesFromNamesArg(argv[ai + 1]);
-            ai += 2;
+        while (ai < argc) {
+            if (std::string_view(argv[ai]) == "--cpu") {
+                ++ai;
+                continue;
+            }
+            if (ai + 1 < argc && std::string(argv[ai]) == "--names") {
+                classNames = loadClassNamesFromNamesArg(argv[ai + 1]);
+                ai += 2;
+                continue;
+            }
+            break;
         }
         if (ai >= argc) {
             printUsage(argv[0]);
@@ -748,11 +840,14 @@ int main(int argc, char** argv) {
     if (arg2 == "--obb") {
         ObbConfig ocfg{
             .modelFile = onnxPath,
-            .scoreThreshold = 0.25f, // 低一点框多，接近 ultralytics 默认
-            .maxDetections = 300,   // 和训练 max_det 对齐，别设太小
-            // 类数要对数据集（DOTA 常 16，COCO 预训练 80）
+            // 置信度阈值：越低召回越多、误检也可能增多（与 Ultralytics predict 默认 conf≈0.25 接近）
+            .scoreThreshold = 0.25f,
+            // 端到端每图最多保留框数；密集场景需与训练 max_det（常 300）对齐，过小会截断
+            .maxDetections = 300,
+            // numClasses 需与模型/数据一致：DOTA 多为 16，官方 yolo26-obb 预训练为 80
             .end2endLayout = true,
             .angleInRadians = true,
+            .backendKind = backendKind,
         };
         Yolo26Obb obbModel(ocfg);
         if (!obbModel.init()) {
@@ -762,9 +857,17 @@ int main(int argc, char** argv) {
 
         std::vector<std::string> obbClassNames;
         int ai = 3;
-        while (ai + 1 < argc && std::string(argv[ai]) == "--names") {
-            obbClassNames = loadClassNamesFromNamesArg(argv[ai + 1]);
-            ai += 2;
+        while (ai < argc) {
+            if (std::string_view(argv[ai]) == "--cpu") {
+                ++ai;
+                continue;
+            }
+            if (ai + 1 < argc && std::string(argv[ai]) == "--names") {
+                obbClassNames = loadClassNamesFromNamesArg(argv[ai + 1]);
+                ai += 2;
+                continue;
+            }
+            break;
         }
         if (ai >= argc) {
             printUsage(argv[0]);
@@ -786,7 +889,8 @@ int main(int argc, char** argv) {
             .modelFile = onnxPath,
             .scoreThreshold = 0.5f,
             .nmsThreshold = 0.5f,
-            // 默认 80 类、17 关键点、end2end；老格式导出才用到 nmsThreshold
+            // 与 cfg/models/26/yolo26-pose.yaml：nc=80, kpt_shape=[17,3], end2end=True；legacy 导出时仍用 nmsThreshold
+            .backendKind = backendKind,
         };
         Yolo26Pose poseModel(pcfg);
         if (!poseModel.init()) {
@@ -796,9 +900,17 @@ int main(int argc, char** argv) {
 
         std::vector<std::string> poseClassNames;
         int ai = 3;
-        while (ai + 1 < argc && std::string(argv[ai]) == "--names") {
-            poseClassNames = loadClassNamesFromNamesArg(argv[ai + 1]);
-            ai += 2;
+        while (ai < argc) {
+            if (std::string_view(argv[ai]) == "--cpu") {
+                ++ai;
+                continue;
+            }
+            if (ai + 1 < argc && std::string(argv[ai]) == "--names") {
+                poseClassNames = loadClassNamesFromNamesArg(argv[ai + 1]);
+                ai += 2;
+                continue;
+            }
+            break;
         }
         if (ai >= argc) {
             printUsage(argv[0]);
@@ -816,8 +928,9 @@ int main(int argc, char** argv) {
     }
 
     Config config = {
-        onnxPath,
-        0.5f,
+        .modelFile = onnxPath,
+        .scoreThreshold = 0.5f,
+        .backendKind = backendKind,
     };
 
     Yolo26Seg model(config);
@@ -828,9 +941,17 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> segClassNames;
     int ai = 2;
-    while (ai + 1 < argc && std::string(argv[ai]) == "--names") {
-        segClassNames = loadClassNamesFromNamesArg(argv[ai + 1]);
-        ai += 2;
+    while (ai < argc) {
+        if (std::string_view(argv[ai]) == "--cpu") {
+            ++ai;
+            continue;
+        }
+        if (ai + 1 < argc && std::string(argv[ai]) == "--names") {
+            segClassNames = loadClassNamesFromNamesArg(argv[ai + 1]);
+            ai += 2;
+            continue;
+        }
+        break;
     }
     if (ai >= argc) {
         printUsage(argv[0]);
